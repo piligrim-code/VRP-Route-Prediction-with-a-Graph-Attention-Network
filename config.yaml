@@ -1,0 +1,32 @@
+# Configuration reference for VRP GNN training.
+# train_with_cost.py currently defines these values inline; this file
+# documents the canonical settings.
+
+# Dataset
+dataset:
+  root: "dataset"
+  train_split: 0.8
+  val_split: 0.2
+
+# Model architecture
+model:
+  node_features: 12   # 5 base + 7 order features
+  edge_features: 3    # distance, duration, toll cost
+  hidden_dim: 256
+  num_heads: 8
+  num_layers: 4
+  dropout: 0.25
+  max_route_length: 50
+
+# Training
+training:
+  batch_size: 32
+  num_epochs: 30
+  learning_rate: 0.0001
+  alpha: 0.1          # route-cost weight in the loss
+  patience: 5
+  device: "cuda"      # or "cpu"
+
+# Paths
+paths:
+  checkpoint_dir: "checkpoints"
