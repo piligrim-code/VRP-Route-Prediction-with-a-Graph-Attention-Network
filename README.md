@@ -22,12 +22,42 @@ VRP constraint that each node is selected at most once.
   training.
 - About 1.8M parameters.
 
-## Result
+## Audit Status And Historical Result
 
-The best checkpoint reaches roughly 78% position-level accuracy on the
-validation split. Sequence-level (exact full-route match) accuracy is lower;
+An earlier private run reported roughly 78% position-level accuracy on a
+validation split. That dataset/checkpoint is not included and this figure has
+not been reproduced for the corrected public version. Sequence-level accuracy
+was lower;
 `evaluate_metrics.py` reports both along with edit distance, LCS ratio, and
 related metrics.
+
+The October 1, 2026 audit found that the old discrete route penalty did not
+contribute a model gradient, and validation refit its own feature scalers.
+Those results are not evidence for the corrected protocol. New training and
+baseline comparison are required before making quality claims.
+
+## Reproducible CPU Checks
+
+```sh
+python -m pip install -r requirements.txt pytest
+python -m pytest tests -q
+```
+
+These tests use tiny synthetic graphs, no downloaded dataset or checkpoint.
+They cover a nonzero route-cost gradient, batched graph offsets, padding,
+saved training scalers, inference without labels, per-graph attention masks
+and a small real-model CPU forward/backward pass.
+
+The new objective adds an **independent-marginal transition-cost surrogate**
+to cross-entropy. It uses raw nonnegative distances, penalizes missing edges,
+and masks graph padding. It is not an exact expected cost under the correlated
+autoregressive policy and does not enforce vehicle capacity, precedence,
+feasibility or optimality. Keep those checks separate from accuracy metrics.
+
+Only training fits normalization statistics. New checkpoints store numeric
+`scaler_state`; validation and inference reuse it without refitting. Old
+checkpoints without these statistics are rejected: retrain them instead of
+guessing a transform. Do not load checkpoints from untrusted sources.
 
 ## Installation
 

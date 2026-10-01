@@ -35,7 +35,8 @@ if Path(checkpoint_path).exists():
     print(f"  Val accuracy: {checkpoint['metrics']['accuracy']:.4f}\n")
 else:
     print(f"Checkpoint not found: {checkpoint_path}")
-    print("Using an untrained model.\n")
+    print("Train a checkpoint with saved scaler_state before inference.\n")
+    sys.exit(1)
 
 model.eval()
 
@@ -50,7 +51,7 @@ if len(scenario_pairs) == 0:
 input_scenario, output_scenario = scenario_pairs[0]
 print(f"Loaded scenario: {input_scenario.get('scenario_id', 'unknown')}\n")
 
-dataset = VRPNodeDataset(scenario_pairs)
+dataset = VRPNodeDataset(scenario_pairs, fit_scalers=False, scaler_state=checkpoint.get('scaler_state'))
 if len(dataset) == 0:
     print("Failed to create dataset.")
     sys.exit(1)

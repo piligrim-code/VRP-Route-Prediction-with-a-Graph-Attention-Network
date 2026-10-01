@@ -16,7 +16,7 @@ class VRPNodeDataset:
     Dataset that converts edge-based routes to node-based routes.
     """
 
-    def __init__(self, scenario_pairs, fit_scalers=True):
+    def __init__(self, scenario_pairs, fit_scalers=True, scaler_state=None, require_targets=True):
         """
         Args:
             scenario_pairs: List of (input_scenario, output_scenario) tuples
@@ -24,6 +24,13 @@ class VRPNodeDataset:
         """
         self.node_scaler = StandardScaler()
         self.edge_scaler = StandardScaler()
+        self.require_targets = require_targets
+        if fit_scalers and scaler_state is not None:
+            raise ValueError('Cannot refit supplied training scalers')
+        if not fit_scalers:
+            if scaler_state is None:
+                raise ValueError('Training scaler_state is required for evaluation/inference')
+            self._restore_scalers(scaler_state)
         self.data = []
 
         # First pass: collect all features to fit scalers
@@ -80,6 +87,31 @@ class VRPNodeDataset:
                 self.data.append(graph_data)
 
         logger.info(f"Initialized VRPNodeDataset with {len(self.data)} scenarios")
+
+    def scaler_state(self):
+        """Checkpoint-safe numeric lists, without pickled sklearn objects."""
+        state = {}
+        for name, scaler in [('node', self.node_scaler), ('edge', self.edge_scaler)]:
+            if not hasattr(scaler, 'mean_'):
+                raise ValueError('No training features available to fit scalers')
+            state[name] = {key: getattr(scaler, key).tolist() for key in ('mean_', 'scale_', 'var_')}
+            state[name]['n_samples_seen_'] = int(scaler.n_samples_seen_)
+        return state
+
+    def _restore_scalers(self, state):
+        for name, scaler, width in [('node', self.node_scaler, 12), ('edge', self.edge_scaler, 3)]:
+            for key in ('mean_', 'scale_', 'var_'):
+                value = np.asarray(state[name][key], dtype=float)
+                if value.shape != (width,) or not np.isfinite(value).all():
+                    raise ValueError('Invalid training scaler statistics')
+                if (key == 'scale_' and (value <= 0).any()) or (key == 'var_' and (value < 0).any()):
+                    raise ValueError('Invalid training scaler statistics')
+                setattr(scaler, key, value.copy())
+            samples = state[name]['n_samples_seen_']
+            if not isinstance(samples, int) or samples <= 0:
+                raise ValueError('Invalid scaler sample count')
+            scaler.n_samples_seen_ = samples
+            scaler.n_features_in_ = width
 
     def _extract_order_features(self, input_scenario, node_id_to_idx):
         """Extract order-related features for each node."""
@@ -200,7 +232,10 @@ class VRPNodeDataset:
 
             edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
 
-            # Normalize edge features
+            raw_edge_costs = torch.tensor([features[0] for features in edge_features], dtype=torch.float32)
+            if not torch.isfinite(raw_edge_costs).all() or (raw_edge_costs < 0).any():
+                raise ValueError('Distances must be finite and nonnegative')
+            # Normalize model inputs, preserving physical distances for the objective.
             edge_features = self.edge_scaler.transform(edge_features)
             edge_attr = torch.tensor(edge_features, dtype=torch.float32)
 
@@ -208,12 +243,12 @@ class VRPNodeDataset:
             route_edges = output_scenario.get('route', [])
             node_sequence = self._edges_to_nodes(route_edges, edges, node_id_to_idx)
 
-            if len(node_sequence) == 0:
+            if len(node_sequence) == 0 and self.require_targets:
                 return None
 
             y = torch.tensor(node_sequence, dtype=torch.long)
 
-            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y, raw_edge_costs=raw_edge_costs)
 
         except Exception as e:
             logger.warning(f"Failed to create graph: {e}")

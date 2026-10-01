@@ -42,7 +42,7 @@ data_loader = VRPDataLoader('dataset')
 all_pairs = data_loader.load_scenario_pairs()
 split_idx = int(len(all_pairs) * 0.8)
 val_pairs = all_pairs[split_idx:]
-val_dataset = VRPNodeDataset(val_pairs)
+val_dataset = VRPNodeDataset(val_pairs, fit_scalers=False, scaler_state=checkpoint.get('scaler_state'))
 print(f"Validation samples: {len(val_dataset)}\n")
 
 # Run inference one sample at a time; predicted and target sequence lengths

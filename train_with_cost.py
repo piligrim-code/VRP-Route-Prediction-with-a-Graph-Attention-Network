@@ -15,7 +15,7 @@ from data.data_loader import VRPDataLoader
 from data.vrp_node_dataset import VRPNodeDataset
 from models.attention_vrp import AttentionVRP
 from training.route_cost_loss import RouteCostLoss
-from torch_geometric.loader import DataLoader
+from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -43,7 +43,9 @@ print(f"Train samples: {len(train_pairs)}")
 print(f"Val samples: {len(val_pairs)}\n")
 
 train_dataset = VRPNodeDataset(train_pairs, fit_scalers=True)
-val_dataset = VRPNodeDataset(val_pairs, fit_scalers=True)
+val_dataset = VRPNodeDataset(val_pairs, fit_scalers=False, scaler_state=train_dataset.scaler_state())
+if not len(train_dataset) or not len(val_dataset):
+    raise ValueError('Training and validation both require usable scenarios')
 
 
 def collate_fn(batch_list):
@@ -113,7 +115,8 @@ for epoch in range(config['num_epochs']):
 
         loss, metrics = criterion(
             logits, predictions, targets_padded,
-            batch.edge_attr, batch.edge_index, batch.batch
+            batch.edge_attr, batch.edge_index, batch.batch,
+            raw_edge_costs=batch.raw_edge_costs
         )
 
         loss.backward()
@@ -160,12 +163,14 @@ for epoch in range(config['num_epochs']):
             logits, predictions, _ = model(
                 batch.x, batch.edge_index, batch.edge_attr, batch.batch,
                 target_nodes=None,
-                teacher_forcing_ratio=0.0
+                teacher_forcing_ratio=0.0,
+                decode_steps=targets_padded.size(1)
             )
 
             loss, metrics = criterion(
                 logits, predictions, targets_padded,
-                batch.edge_attr, batch.edge_index, batch.batch
+                batch.edge_attr, batch.edge_index, batch.batch,
+                raw_edge_costs=batch.raw_edge_costs
             )
 
             val_loss += metrics['total_loss']
@@ -198,6 +203,8 @@ for epoch in range(config['num_epochs']):
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state': train_dataset.scaler_state(),
+            'objective_version': 'independent_transition_surrogate_v1',
             'metrics': {
                 'accuracy': val_acc,
                 'loss': avg_val_loss,

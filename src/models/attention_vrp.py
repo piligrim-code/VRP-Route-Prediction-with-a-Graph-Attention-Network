@@ -64,7 +64,7 @@ class AttentionDecoder(nn.Module):
             # attention needs: 0 for valid, -inf for invalid
             attn_mask = (1 - mask) * -1e9
             # Expand for multi-head: [B, 1, N] -> [B*num_heads, 1, N]
-            attn_mask = attn_mask.unsqueeze(1).repeat(self.num_heads, 1, 1)  # [B*H, 1, N]
+            attn_mask = attn_mask.unsqueeze(1).repeat_interleave(self.num_heads, dim=0)  # [B*H, 1, N]
         else:
             attn_mask = None
 
@@ -167,7 +167,7 @@ class AttentionVRP(nn.Module):
 
         return node_emb
 
-    def forward(self, x, edge_index, edge_attr, batch, target_nodes=None, teacher_forcing_ratio=0.8):
+    def forward(self, x, edge_index, edge_attr, batch, target_nodes=None, teacher_forcing_ratio=0.8, decode_steps=None):
         """
         Args:
             x: [num_nodes, node_features]
@@ -209,6 +209,10 @@ class AttentionVRP(nn.Module):
         # Determine sequence length
         if target_nodes is not None:
             max_seq_len = target_nodes.size(1)
+        elif decode_steps is not None:
+            if isinstance(decode_steps, bool) or not isinstance(decode_steps, int) or decode_steps <= 0:
+                raise ValueError('decode_steps must be a positive integer')
+            max_seq_len = decode_steps
         else:
             max_seq_len = min(self.max_route_length, max_nodes)
 
