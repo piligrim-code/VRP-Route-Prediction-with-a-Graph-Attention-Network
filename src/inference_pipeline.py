@@ -68,6 +68,9 @@ class VRPInferencePipeline:
             raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        self.scalers = checkpoint.get('scaler_state')
+        if self.scalers is None:
+            raise ValueError('Checkpoint has no training scaler_state; retrain before inference')
 
         # Create model
         self.model = AttentionVRP(
@@ -107,14 +110,10 @@ class VRPInferencePipeline:
         start_time = time.time()
 
         try:
-            # Create dataset (fit scalers if first time)
-            if self.scalers is None:
-                dataset = VRPNodeDataset([(input_scenario, {})], fit_scalers=True)
-                self.scalers = (dataset.node_scaler, dataset.edge_scaler)
-            else:
-                dataset = VRPNodeDataset([(input_scenario, {})], fit_scalers=False)
-                dataset.node_scaler = self.scalers[0]
-                dataset.edge_scaler = self.scalers[1]
+            dataset = VRPNodeDataset([(input_scenario, {})], fit_scalers=False,
+                                     scaler_state=self.scalers, require_targets=False)
+            if not len(dataset):
+                raise ValueError('Scenario contains no usable graph')
 
             graph_data = dataset[0].to(self.device)
             batch = torch.zeros(graph_data.x.shape[0], dtype=torch.long, device=self.device)

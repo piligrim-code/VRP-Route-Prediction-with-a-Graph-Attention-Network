@@ -1,144 +1,86 @@
+"""Cross-entropy plus an independent-marginal transition-cost surrogate.
+
+The surrogate is differentiable in logits, not a claim of a valid VRP route
+or an exact expected cost under the autoregressive policy. Missing edges
+(including self-transitions) receive a penalty above all observed edge costs.
 """
-Enhanced training with route cost in loss function.
-"""
+import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Tuple
+from torch import nn
+from torch.nn import functional as F
 
 
 class RouteCostLoss(nn.Module):
-    """
-    Loss function that combines cross-entropy with route cost.
-    """
-
-    def __init__(self, alpha: float = 0.1):
-        """
-        Args:
-            alpha: Weight for route cost loss (0.0 = only CE, 1.0 = only cost)
-        """
+    def __init__(self, alpha=0.1):
         super().__init__()
+        if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+            raise ValueError('alpha must be between zero and one')
         self.alpha = alpha
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        edge_attr: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute combined loss.
-
-        Args:
-            logits: [batch_size, seq_len, num_nodes]
-            predictions: [batch_size, seq_len]
-            targets: [batch_size, seq_len]
-            edge_attr: [num_edges, 3] - [distance, duration, toll_cost]
-            edge_index: [2, num_edges]
-            batch: [num_nodes]
-
-        Returns:
-            loss: Combined loss
-            metrics: Dict with loss components
-        """
-        batch_size, seq_len, num_nodes = logits.shape
-
-        # Cross-entropy loss
-        ce_loss = self.ce_loss(
-            logits.reshape(-1, num_nodes),
-            targets.reshape(-1)
-        )
-
-        # Route cost loss (only if alpha > 0)
+    def forward(self, logits, predictions, targets, edge_attr, edge_index, batch,
+                raw_edge_costs=None):
+        if logits.ndim != 3 or targets.shape != logits.shape[:2]:
+            raise ValueError('logits and targets must have matching batch/sequence dimensions')
+        if targets.dtype != torch.long or batch.dtype != torch.long or edge_index.dtype != torch.long:
+            raise ValueError('targets, batch and edge_index must contain int64 indices')
+        if batch.ndim != 1 or not torch.equal(batch.unique(sorted=True), torch.arange(logits.size(0), device=batch.device)):
+            raise ValueError('batch must identify every graph from zero to batch_size-1')
+        if edge_index.ndim != 2 or edge_index.size(0) != 2:
+            raise ValueError('edge_index must have shape [2, edges]')
+        if edge_index.numel() and (edge_index.min() < 0 or edge_index.max() >= batch.numel()):
+            raise ValueError('Edge endpoint out of range')
+        if edge_index.numel() and (batch[edge_index[0]] != batch[edge_index[1]]).any():
+            raise ValueError('Edges must not cross graphs')
         if self.alpha > 0:
-            route_cost_loss = self._compute_route_cost_loss(
-                predictions, targets, edge_attr, edge_index, batch
-            )
-        else:
-            route_cost_loss = torch.tensor(0.0, device=logits.device)
+            if raw_edge_costs is None:
+                raise ValueError('raw_edge_costs are required; normalized edge_attr is not a distance')
+            if raw_edge_costs.shape != (edge_index.size(1),) or not torch.isfinite(raw_edge_costs).all() or (raw_edge_costs < 0).any():
+                raise ValueError('raw_edge_costs must be finite nonnegative distances, one per edge')
 
-        # Combined loss
-        total_loss = (1 - self.alpha) * ce_loss + self.alpha * route_cost_loss
-
-        metrics = {
-            'ce_loss': ce_loss.item(),
-            'route_cost_loss': route_cost_loss.item(),
-            'total_loss': total_loss.item()
-        }
-
-        return total_loss, metrics
-
-    def _compute_route_cost_loss(
-        self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        edge_attr: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute route cost loss based on predicted routes.
-
-        Penalizes routes that are longer than ground truth.
-        """
-        batch_size = predictions.shape[0]
-        device = predictions.device
-
-        # Build edge cost matrix
-        # batch contains graph assignment for each node, so len(batch) = total nodes
-        num_nodes = len(batch)
-        cost_matrix = torch.zeros(num_nodes, num_nodes, device=device)
-
-        # Fill cost matrix with distances
-        for i in range(edge_index.shape[1]):
-            src = edge_index[0, i].item()
-            dst = edge_index[1, i].item()
-            distance = edge_attr[i, 0]  # distance_km
-            cost_matrix[src, dst] = distance
-
-        total_cost_loss = 0.0
-        valid_samples = 0
-
-        # Compute cost for each sample in batch
-        for b in range(batch_size):
-            pred_route = predictions[b]
-            target_route = targets[b]
-
-            # Filter out padding (-1)
-            valid_pred = pred_route[pred_route != -1]
-            valid_target = target_route[target_route != -1]
-
-            if len(valid_pred) < 2 or len(valid_target) < 2:
+        zero = torch.where(torch.isfinite(logits), logits, 0).sum() * 0
+        ce_sum, valid_count, penalties = zero, 0, []
+        for graph in range(logits.size(0)):
+            nodes = (batch == graph).nonzero(as_tuple=True)[0]
+            n = nodes.numel()
+            if n > logits.size(-1):
+                raise ValueError('logits do not cover all graph nodes')
+            y = targets[graph]
+            valid = y != -1
+            if ((y < -1) | (y >= n)).any():
+                raise ValueError('Target node is outside its graph')
+            if not valid.any():
+                continue
+            scores = logits[graph, :, :n]
+            active = scores[valid]
+            if torch.isnan(active).any() or torch.isposinf(active).any() or not torch.isfinite(active).any(dim=-1).all():
+                raise ValueError('Every active position must have a finite node score')
+            ce_sum = ce_sum + F.cross_entropy(active, y[valid], reduction='sum')
+            valid_count += int(valid.sum())
+            transitions = valid[:-1] & valid[1:]
+            if self.alpha == 0 or not transitions.any():
                 continue
 
-            # Compute predicted route cost
-            pred_cost = 0.0
-            for i in range(len(valid_pred) - 1):
-                src = valid_pred[i].item()
-                dst = valid_pred[i + 1].item()
-                if src < num_nodes and dst < num_nodes:
-                    pred_cost += cost_matrix[src, dst]
+            # Convert globally batched edge endpoints to graph-local indices.
+            local = torch.full_like(batch, -1)
+            local[nodes] = torch.arange(n, device=batch.device)
+            edges = batch[edge_index[0]] == graph
+            costs = raw_edge_costs[edges].to(dtype=logits.dtype)
+            scale = costs.max().clamp_min(1) if costs.numel() else logits.new_tensor(1)
+            missing_cost = scale * 2 + 1
+            matrix = missing_cost.expand(n, n).clone()
+            endpoints = local[edge_index[:, edges]]
+            for i in range(costs.numel()):
+                src, dst = endpoints[:, i]
+                matrix[src, dst] = torch.minimum(matrix[src, dst], costs[i])
+            safe_scores = scores.masked_fill(~valid.unsqueeze(-1), 0)
+            probs = torch.softmax(safe_scores, dim=-1)
+            expected = ((probs[:-1] @ matrix) * probs[1:]).sum(dim=-1)
+            penalties.append((expected[transitions] / scale).mean())
 
-            # Compute target route cost
-            target_cost = 0.0
-            for i in range(len(valid_target) - 1):
-                src = valid_target[i].item()
-                dst = valid_target[i + 1].item()
-                if src < num_nodes and dst < num_nodes:
-                    target_cost += cost_matrix[src, dst]
-
-            # Loss: penalize if predicted cost > target cost
-            if target_cost > 0:
-                cost_ratio = pred_cost / (target_cost + 1e-6)
-                total_cost_loss += F.relu(cost_ratio - 1.0)  # Only penalize if worse
-                valid_samples += 1
-
-        if valid_samples > 0:
-            return total_cost_loss / valid_samples
-        else:
-            return torch.tensor(0.0, device=device)
-
+        ce = ce_sum / max(valid_count, 1)
+        route = torch.stack(penalties).mean() if penalties else zero
+        total = (1 - self.alpha) * ce + self.alpha * route
+        return total, {'ce_loss': ce.detach().item(),
+                       'route_cost_loss': route.detach().item(),
+                       'total_loss': total.detach().item()}
